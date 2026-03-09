@@ -5,3 +5,4 @@
 # Ignore folders
 .devcontainer/
 .vscode/
+src/Dataset/
