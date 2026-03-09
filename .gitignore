@@ -1,6 +1,6 @@
 # Ignore files
-.txt
-.pt
+*.txt
+*.pt
 
 # Ignore folders
 .devcontainer/
