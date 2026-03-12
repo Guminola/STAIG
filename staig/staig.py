@@ -62,7 +62,7 @@ def convert_edge_probabilities(
     adj_matrix: torch.Tensor, edge_prob_matrix: torch.Tensor
 ) -> torch.Tensor:
     row, col = torch.where(adj_matrix != 0)
-    edge_probs = edge_prob_matrix[row, col]
+    edge_probs: torch.Tensor = edge_prob_matrix[row, col]
     return edge_probs
 
 
@@ -94,18 +94,19 @@ class STAGM:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.radius: int = 15
         self.tool: str = "mclust"  # mclust, leiden, and louvain
+        self.adata: AnnData = None
+        self.mask_slices: bool = True
         self.bar_format: str = (
             "{l_bar}{bar}| [{elapsed}<{remaining}, {rate_fmt}{postfix}]"
         )
-        self.encoder = Encoder(
+
+        self.encoder: Encoder = Encoder(
             self.num_gene,
             self.num_hidden,
             self.activation,
             base_model=self.base_model,
-            k=self.num_layers,
+            num_layers=self.num_layers,
         ).to(self.device)
-        self.adata = None
-        self.mask_slices = True
 
         if single:
             self.model = (
@@ -128,7 +129,6 @@ class STAGM:
         )
 
     def train(self) -> None:
-        print("=== prepare for training ===")
         if self.adata is None:
             raise ValueError("adata not load!")
 
@@ -172,7 +172,6 @@ class STAGM:
                     pseudo_labels = generate_pseudo_labels(self.adata.obsm["img_emb"])
                 pseudo_labels = pseudo_labels.to(self.device)
 
-        print("=== train ===")
         for _ in tqdm.tqdm(range(1, self.num_epochs + 1), bar_format=self.bar_format):
             self.model.train()
             self.optimizer.zero_grad()
@@ -200,7 +199,7 @@ class STAGM:
         if not self.single:
             torch.save(self.model.state_dict(), "model.pt")
 
-    def eva(self):
+    def eva(self) -> None:
         print("=== load ===")
         self.model.load_state_dict(torch.load("model.pt"))
         self.model.eval()
@@ -220,7 +219,7 @@ class STAGM:
         print(self.adata.obsm["emb"])
         print("embedding generated, go clustering")
 
-    def cluster(self, label=True):
+    def cluster(self, label: bool = True) -> None:
         if self.tool == "mclust":
             clustering(
                 self.adata,
@@ -229,6 +228,7 @@ class STAGM:
                 method=self.tool,
                 refinement=self.refine,
             )  # For DLPFC dataset, we use optional refinement step.
+
         elif self.tool in ["leiden", "louvain"]:
             clustering(
                 self.adata,
@@ -254,6 +254,7 @@ class STAGM:
             self.adata.uns["nmi"] = NMI
             print("ARI:", ARI)
             print("NMI:", NMI)
+
         else:
             print("calculate SC and DB")
             SC = silhouette_score(self.adata.obsm["emb"], self.adata.obs["domain"])
@@ -262,6 +263,7 @@ class STAGM:
             self.adata.uns["db"] = DB
             print("SC:", SC)
             print("DB:", DB)
+
         if "batch" in (self.adata.obs):
             BatchKL(self.adata)
             ILISI = hm.compute_lisi(
@@ -272,7 +274,7 @@ class STAGM:
             median_ILISI = np.median(ILISI)
             print(f"Median ILISI: {median_ILISI:.2f}")
 
-    def draw_spatial(self, p=""):
+    def draw_spatial(self, p: str = "") -> None:
         sc.pl.spatial(
             self.adata,
             img_key="hires",
@@ -282,7 +284,7 @@ class STAGM:
             save=p + str(self.args.slide) + ".png",
         )
 
-    def draw_single_spatial(self):
+    def draw_single_spatial(self) -> None:
         sc.pl.embedding(
             self.adata,
             basis="spatial",
@@ -291,7 +293,7 @@ class STAGM:
             save=str(self.args.slide) + ".png",
         )
 
-    def draw_umap(self):
+    def draw_umap(self) -> None:
         print("start umap")
         sc.pp.neighbors(self.adata, use_rep="emb")
         sc.tl.umap(self.adata)
@@ -307,7 +309,7 @@ class STAGM:
             show=True,
             save=str(self.args.slide) + "_batch.pdf",
         )
-        if self.args.label == True:
+        if self.args.label is True:
             sc.pl.umap(
                 self.adata,
                 color="ground_truth",
@@ -315,7 +317,7 @@ class STAGM:
                 save=str(self.args.slide) + "_label.pdf",
             )
 
-    def draw_horizontal(self):
+    def draw_horizontal(self) -> None:
         adata_batch_0 = self.adata[self.adata.obs["batch"] == "0", :]
         sc.pl.embedding(adata_batch_0, basis="spatial", color="domain", save="0.png")
 
