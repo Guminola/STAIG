@@ -66,7 +66,7 @@ def convert_edge_probabilities(
     return edge_probs
 
 
-class STAGM:
+class STAIG:
     def __init__(
         self,
         args: argparse.Namespace,
@@ -131,6 +131,7 @@ class STAGM:
     def train(self) -> None:
         if self.adata is None:
             raise ValueError("adata not load!")
+        print('=== prepare for training ===')
 
         features_matrix = (
             torch.FloatTensor(self.adata.obsm["feat"].copy()).to(self.device).double()
