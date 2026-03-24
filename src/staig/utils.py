@@ -39,13 +39,14 @@ def clustering(
     adata,
     n_clusters=7,
     radius=50,
+    key="emb",
     method="mclust",
     start=0.1,
     end=3.0,
     increment=0.01,
     refinement=False,
 ):
-    """\
+    """
     Spatial clustering based the learned representation.
 
     Parameters
@@ -59,13 +60,13 @@ def clustering(
     key : string, optional
         The key of the learned representation in adata.obsm. The default is 'emb'.
     method : string, optional
-        The tool for clustering. Supported tools include 'mclust', 'leiden', and 'louvain'. The default is 'mclust'. 
+        The tool for clustering. Supported tools include 'mclust', 'leiden', and 'louvain'. The default is 'mclust'.
     start : float
         The start value for searching. The default is 0.1.
-    end : float 
+    end : float
         The end value for searching. The default is 3.0.
     increment : float
-        The step size to increase. The default is 0.01.   
+        The step size to increase. The default is 0.01.
     refinement : bool, optional
         Refine the predicted labels or not. The default is False.
 
@@ -74,36 +75,29 @@ def clustering(
     None.
 
     """
-
     if method == "mclust":
-        adata = mclust_R(adata, used_obsm="emb", num_cluster=n_clusters)
+        adata = mclust_R(adata, used_obsm=key, num_cluster=n_clusters)
         adata.obs["domain"] = adata.obs["mclust"]
-    elif method == "leiden":
+
+    elif method in ("leiden", "louvain"):
         res = search_res(
             radius,
             adata,
             n_clusters,
-            use_rep="norm_emb",
+            use_rep=key,
             method=method,
             start=start,
             end=end,
             increment=increment,
         )
-        sc.tl.leiden(adata, random_state=0, resolution=res)
-        adata.obs["domain"] = adata.obs["leiden"]
-    elif method == "louvain":
-        res = search_res(
-            radius,
-            adata,
-            n_clusters,
-            use_rep="norm_emb",
-            method=method,
-            start=start,
-            end=end,
-            increment=increment,
-        )
-        sc.tl.louvain(adata, random_state=0, resolution=res)
-        adata.obs["domain"] = adata.obs["louvain"]
+
+        if method == "leiden":
+            sc.tl.leiden(adata, random_state=0, resolution=res)
+
+        else:
+            sc.tl.louvain(adata, random_state=0, resolution=res)
+
+        adata.obs["domain"] = adata.obs[method]
 
     if refinement:
         new_type = refine_label(adata, radius, key="domain")
@@ -112,28 +106,20 @@ def clustering(
 
 def refine_label(adata, radius=50, key="label"):
     n_neigh = radius
-    new_type = []
     old_type = adata.obs[key].values
 
-    # calculate distance
+    # Calculate pairwise euclidean distances between spatial positions
     position = adata.obsm["spatial"]
     distance = ot.dist(position, position, metric="euclidean")
 
     n_cell = distance.shape[0]
-
+    new_type = []
     for i in range(n_cell):
-        vec = distance[i, :]
-        index = vec.argsort()
-        neigh_type = []
-        for j in range(1, n_neigh + 1):
-            neigh_type.append(old_type[index[j]])
-        max_type = max(neigh_type, key=neigh_type.count)
-        new_type.append(max_type)
+        index = distance[i, :].argsort()
+        neigh_type = [old_type[index[j]] for j in range(1, n_neigh + 1)]
+        new_type.append(max(neigh_type, key=neigh_type.count))
 
-    new_type = [str(i) for i in list(new_type)]
-    # adata.obs['label_refined'] = np.array(new_type)
-
-    return new_type
+    return [str(i) for i in new_type]
 
 
 def search_res(
@@ -146,9 +132,9 @@ def search_res(
     end=3.0,
     increment=0.01,
 ):
-    """\
+    """
     Searching corresponding resolution according to given cluster number
-    
+
     Parameters
     ----------
     adata : anndata
@@ -156,73 +142,69 @@ def search_res(
     n_clusters : int
         Targetting number of clusters.
     method : string
-        Tool for clustering. Supported tools include 'leiden' and 'louvain'. The default is 'leiden'.    
+        Tool for clustering. Supported tools include 'leiden' and 'louvain'. The default is 'leiden'.
     use_rep : string
         The indicated representation for clustering.
     start : float
         The start value for searching.
-    end : float 
+    end : float
         The end value for searching.
     increment : float
         The step size to increase.
-        
+
     Returns
     -------
     res : float
         Resolution.
-        
-    """
-    print("Searching resolution...")
-    label = 0
-    ress = []
-    best = None
-    sc.pp.neighbors(adata, n_neighbors=20, use_rep=use_rep)
-    sc.tl.leiden(adata, random_state=0, resolution=end)
-    count_unique = len(pd.DataFrame(adata.obs["leiden"]).leiden.unique())
-    while count_unique > n_clusters + 2:
-        print(count_unique)
-        print("太大，继续调整")
-        end = end - 0.1
-        sc.tl.leiden(adata, random_state=0, resolution=end)
-        count_unique = len(pd.DataFrame(adata.obs["leiden"]).leiden.unique())
-    while count_unique < n_clusters + 2:
-        print(count_unique)
-        print("太小，继续调整")
-        end = end + 0.1
-        sc.tl.leiden(adata, random_state=0, resolution=end)
-        count_unique = len(pd.DataFrame(adata.obs["leiden"]).leiden.unique())
 
-    for res in sorted(list(np.arange(start, end, increment)), reverse=True):
+    """
+
+    def _cluster(resolution):
+        """Run the chosen clustering method and return the unique cluster count."""
         if method == "leiden":
-            sc.tl.leiden(adata, random_state=0, resolution=res)
-            count_unique = len(pd.DataFrame(adata.obs["leiden"]).leiden.unique())
-            print("resolution={}, cluster number={}".format(res, count_unique))
-        elif method == "louvain":
-            sc.tl.louvain(adata, random_state=0, resolution=res)
-            count_unique = len(pd.DataFrame(adata.obs["louvain"]).louvain.unique())
-            print("resolution={}, cluster number={}".format(res, count_unique))
+            sc.tl.leiden(adata, random_state=0, resolution=resolution)
+            return len(adata.obs["leiden"].unique())
+        else:
+            sc.tl.louvain(adata, random_state=0, resolution=resolution)
+            return len(adata.obs["louvain"].unique())
+
+    print("Searching resolution...")
+    sc.pp.neighbors(adata, n_neighbors=20, use_rep=use_rep)
+
+    # Coarsely adjust `end` so the upper-bound cluster count is n_clusters + 2
+    count_unique = _cluster(end)
+    while count_unique > n_clusters + 2:
+        print(f"Cluster count {count_unique} is too large, adjusting end downward...")
+        end -= 0.1
+        count_unique = _cluster(end)
+    while count_unique < n_clusters + 2:
+        print(f"Cluster count {count_unique} is too small, adjusting end upward...")
+        end += 0.1
+        count_unique = _cluster(end)
+
+    # Fine-grained search over [start, end)
+    ress = []
+    found = False
+    for res in sorted(np.arange(start, end, increment), reverse=True):
+        count_unique = _cluster(res)
+        print(f"resolution={res:.4f}, cluster number={count_unique}")
 
         if count_unique == n_clusters:
-            print("calculate metric ARI")
-            # calculate metric ARI
             new_type = refine_label(adata, radius, key="leiden")
             adata.obs["leiden"] = new_type
-
             ARI = metrics.adjusted_rand_score(
                 adata.obs["leiden"], adata.obs["ground_truth"]
             )
             adata.uns["ARI"] = ARI
             ress.append((res, ARI))
-            print("ARI:", ARI)
+            print(f"ARI: {ARI:.4f}")
 
         if count_unique == n_clusters - 2:
-            label = 1
+            found = True
             best = max(ress, key=lambda x: x[1])
-            print(best)
+            print(f"Best resolution found: {best}")
             break
 
-    assert label == 1, (
-        "Resolution is not found. Please try bigger range or smaller step!."
-    )
+    assert found, "Resolution not found. Please try a bigger range or a smaller step."
 
     return best[0]

@@ -93,7 +93,7 @@ class STAGM:
         self.refine: bool = refine
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.radius: int = 15
-        self.tool: str = "mclust"  # mclust, leiden, and louvain
+        self.tool: str = "leiden"  # mclust, leiden, and louvain
         self.bar_format: str = (
             "{l_bar}{bar}| [{elapsed}<{remaining}, {rate_fmt}{postfix}]"
         )
