@@ -1,9 +1,10 @@
+from typing import Optional, Tuple
+
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv
-from typing import Optional, Tuple
-import torch
 from torch import Tensor
+from torch_geometric.nn import GCNConv
 from torch_geometric.typing import OptTensor
 
 
@@ -14,229 +15,261 @@ class Encoder(torch.nn.Module):
         out_channels: int,
         activation,
         base_model=GCNConv,
-        k: int = 2,
+        num_layers: int = 2,
     ):
-        super(Encoder, self).__init__()
+        super().__init__()
+        assert num_layers >= 1
+
         self.base_model = base_model
-
-        assert k >= 1
-        self.k = k
-        self.conv = [
-            base_model(in_channels, out_channels if k == 1 else 2 * out_channels)
-        ]
-        for _ in range(1, k - 1):
-            self.conv.append(base_model(2 * out_channels, 2 * out_channels))
-        if k > 1:
-            self.conv.append(base_model(2 * out_channels, out_channels))
-        self.conv = nn.ModuleList(self.conv)
-
+        self.num_layers = num_layers
         self.activation = activation
 
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor):
-        for i in range(self.k):
-            x = self.activation(self.conv[i](x, edge_index))
-        return x
+        # First layer: project to 2*out_channels unless it's the only layer
+        conv_layers = [
+            base_model(
+                in_channels, out_channels if num_layers == 1 else 2 * out_channels
+            )
+        ]
+        for _ in range(1, num_layers - 1):
+            conv_layers.append(base_model(2 * out_channels, 2 * out_channels))
+        if num_layers > 1:
+            conv_layers.append(base_model(2 * out_channels, out_channels))
+
+        self.conv_layers = nn.ModuleList(conv_layers)
+
+    def forward(self, node_features: Tensor, edge_index: Tensor) -> Tensor:
+        node_emb = node_features
+        for conv in self.conv_layers:
+            node_emb = self.activation(conv(node_emb, edge_index))
+        return node_emb
 
 
-class MVmodel(torch.nn.Module):
+# Shared projection + similarity mixin
+class _ProjectionMixin(torch.nn.Module):
+    """Shared projection head and cosine-similarity helpers for MV/SV models."""
+
+    def __init__(self, num_hidden: int, num_proj_hidden: int, tau: float):
+        super().__init__()
+        self.tau = tau
+        self.forward_proj_1 = nn.Linear(num_hidden, num_proj_hidden)
+        self.forward_proj_2 = nn.Linear(num_proj_hidden, num_hidden)
+
+    def projection(self, gnn_embedding: Tensor) -> Tensor:
+        projected = F.elu(self.forward_proj_1(gnn_embedding))
+        return self.forward_proj_2(projected)
+
+    def similarity_matrix(self, emb_a: Tensor, emb_b: Tensor) -> Tensor:
+        """Normalised dot-product similarity matrix between two embedding sets."""
+        emb_a = F.normalize(emb_a)
+        emb_b = F.normalize(emb_b)
+        return torch.mm(emb_a, emb_b.t())
+
+    def tau_scaling(self, sim: Tensor) -> Tensor:
+        """Scales a similarity matrix by temperature tau (used in NT-Xent losses)."""
+        return torch.exp(sim / self.tau)
+
+    def _reduce(self, per_node_loss: Tensor, mean: bool) -> Tensor:
+        return per_node_loss.mean() if mean else per_node_loss.sum()
+
+    @staticmethod
+    def _strip_self_loops(adj: Tensor) -> Tensor:
+        """Returns a binarised adjacency matrix with the diagonal zeroed out."""
+        adj = adj - torch.diag_embed(adj.diag())
+        adj[adj > 0] = 1
+        return adj
+
+    @staticmethod
+    def _positive_pair_counts(adj: Tensor) -> Tensor:
+        """
+        Number of positive pairs per node:
+          intra-view neighbours + inter-view neighbours + self inter-view = 2*|N_i| + 1
+        """
+        return torch.squeeze(torch.tensor(torch.sum(adj, 1) * 2 + 1))
+
+
+# Multi-View model
+class MVmodel(_ProjectionMixin):
     def __init__(
-        self, encoder: Encoder, num_hidden: int, num_proj_hidden: int, tau: float = 0.5
+        self,
+        encoder: Encoder,
+        num_hidden: int,
+        num_proj_hidden: int,
+        tau: float = 0.5,
     ):
-        super(MVmodel, self).__init__()
-        self.encoder: Encoder = encoder
-        self.tau: float = tau
+        super().__init__(num_hidden, num_proj_hidden, tau)
+        self.encoder = encoder
 
-        self.fc1 = torch.nn.Linear(num_hidden, num_proj_hidden)
-        self.fc2 = torch.nn.Linear(num_proj_hidden, num_hidden)
+    def forward(self, node_features: Tensor, edge_index: Tensor) -> Tensor:
+        gnn_embedding = self.encoder(node_features, edge_index)
+        projected_embedding = self.projection(gnn_embedding)
+        return projected_embedding
 
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
-        z = self.encoder(x, edge_index)
-        h = self.projection(z)
-        return h
-
-    def projection(self, z: torch.Tensor) -> torch.Tensor:
-        z = F.elu(self.fc1(z))
-        return self.fc2(z)
-
-    def sim(self, z1: torch.Tensor, z2: torch.Tensor):
-        z1 = F.normalize(z1)
-        z2 = F.normalize(z2)
-        return torch.mm(z1, z2.t())
-
-    def semi_loss(self, z1: torch.Tensor, z2: torch.Tensor):
-        f = lambda x: torch.exp(x / self.tau)
-        refl_sim = f(self.sim(z1, z1))
-        between_sim = f(self.sim(z1, z2))
-
+    # Basic (non-neighbour-aware) contrastive loss
+    def _semi_loss(self, emb_a: Tensor, emb_b: Tensor) -> Tensor:
+        self_sim = self.tau_scaling(self.similarity_matrix(emb_a, emb_a))
+        cross_sim = self.tau_scaling(self.similarity_matrix(emb_a, emb_b))
         return -torch.log(
-            between_sim.diag()
-            / (refl_sim.sum(1) + between_sim.sum(1) - refl_sim.diag())
+            cross_sim.diag() / (self_sim.sum(1) + cross_sim.sum(1) - self_sim.diag())
         )
 
     def loss(
-        self, h1: torch.Tensor, h2: torch.Tensor, mean: bool = True, batch_size: int = 0
-    ):
+        self,
+        proj_emb_1: Tensor,
+        proj_emb_2: Tensor,
+        mean: bool = True,
+        batch_size: int = 0,
+    ) -> Tensor:
+        per_node = (
+            self._semi_loss(proj_emb_1, proj_emb_2)
+            + self._semi_loss(proj_emb_2, proj_emb_1)
+        ) * 0.5
+        return self._reduce(per_node, mean)
 
-        l1 = self.semi_loss(h1, h2)
-        l2 = self.semi_loss(h2, h1)
-        ret = (l1 + l2) * 0.5
-        ret = ret.mean() if mean else ret.sum()
+    # Neighbour-aware contrastive loss
 
-        return ret
+    def _neighbor_contrastive_loss(
+        self, emb_a: Tensor, emb_b: Tensor, adj: Tensor
+    ) -> Tensor:
+        """Neighbour contrastive loss (unbiased variant)."""
+        adj = self._strip_self_loops(adj)
+        positive_pair_counts = self._positive_pair_counts(adj)
 
-    def nei_con_loss(self, z1: torch.Tensor, z2: torch.Tensor, adj):
-        """neighbor contrastive loss"""
-        adj = adj - torch.diag_embed(adj.diag())  # remove self-loop
-        adj[adj > 0] = 1
-        nei_count = (
-            torch.sum(adj, 1) * 2 + 1
-        )  # intra-view nei+inter-view nei+self inter-view
-        nei_count = torch.squeeze(torch.tensor(nei_count))
+        intra_sim = self.tau_scaling(self.similarity_matrix(emb_a, emb_a))
+        inter_sim = self.tau_scaling(self.similarity_matrix(emb_a, emb_b))
 
-        f = lambda x: torch.exp(x / self.tau)
-        intra_view_sim = f(self.sim(z1, z1))
-        inter_view_sim = f(self.sim(z1, z2))
-
-        loss = (
-            inter_view_sim.diag()
-            + (intra_view_sim.mul(adj)).sum(1)
-            + (inter_view_sim.mul(adj)).sum(1)
-        ) / (intra_view_sim.sum(1) + inter_view_sim.sum(1) - intra_view_sim.diag())
-        loss = loss / nei_count  # divided by the number of positive pairs for each node
-
-        return -torch.log(loss)
-
-    def contrastive_loss(
-        self, z1: torch.Tensor, z2: torch.Tensor, adj, mean: bool = True
-    ):
-        l1 = self.nei_con_loss(z1, z2, adj)
-        l2 = self.nei_con_loss(z2, z1, adj)
-        ret = (l1 + l2) * 0.5
-        ret = ret.mean() if mean else ret.sum()
-
-        return ret
-
-    def nei_con_loss_bias(self, z1: torch.Tensor, z2: torch.Tensor, adj, pseudo_labels):
-        """neighbor contrastive loss"""
-        adj = adj - torch.diag_embed(adj.diag())  # remove self-loop
-        adj[adj > 0] = 1
-        nei_count = (
-            torch.sum(adj, 1) * 2 + 1
-        )  # intra-view nei+inter-view nei+self inter-view
-        nei_count = torch.squeeze(torch.tensor(nei_count))
-
-        f = lambda x: torch.exp(x / self.tau)
-        intra_view_sim = f(self.sim(z1, z1))
-        inter_view_sim = f(self.sim(z1, z2))
-
-        # Create a mask for negative samples with different pseudo labels
-        negative_mask = (pseudo_labels.view(-1, 1) != pseudo_labels.view(1, -1)).float()
-
-        # Apply the mask to intra_view_sim and inter_view_sim
-        masked_intra_view_sim = intra_view_sim * negative_mask
-        masked_inter_view_sim = inter_view_sim * negative_mask
-
-        loss = (
-            inter_view_sim.diag()
-            + (intra_view_sim.mul(adj)).sum(1)
-            + (inter_view_sim.mul(adj)).sum(1)
-        ) / (
-            masked_intra_view_sim.sum(1)
-            + masked_inter_view_sim.sum(1)
-            - intra_view_sim.diag()
+        numerator = (
+            inter_sim.diag() + intra_sim.mul(adj).sum(1) + inter_sim.mul(adj).sum(1)
         )
-        loss = loss / nei_count  # divided by the number of positive pairs for each node
+        denominator = intra_sim.sum(1) + inter_sim.sum(1) - intra_sim.diag()
 
-        return -torch.log(loss)
-
-    def contrastive_loss_bias(
-        self, z1: torch.Tensor, z2: torch.Tensor, adj, pseudo_labels, mean: bool = True
-    ):
-        l1 = self.nei_con_loss_bias(z1, z2, adj, pseudo_labels)
-        l2 = self.nei_con_loss_bias(z2, z1, adj, pseudo_labels)
-        ret = (l1 + l2) * 0.5
-        ret = ret.mean() if mean else ret.sum()
-
-        return ret
-
-
-class SVmodel(torch.nn.Module):
-    def __init__(
-        self, encoder: Encoder, num_hidden: int, num_proj_hidden: int, tau: float = 0.5
-    ):
-        super(SVmodel, self).__init__()
-        self.encoder: Encoder = encoder
-        self.tau: float = tau
-
-        self.fc1 = torch.nn.Linear(num_hidden, num_proj_hidden)
-        self.fc2 = torch.nn.Linear(num_proj_hidden, num_hidden)
-
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
-        z = self.encoder(x, edge_index)
-        h = self.projection(z)
-        return h
-
-    def projection(self, z: torch.Tensor) -> torch.Tensor:
-        z = F.elu(self.fc1(z))
-        return self.fc2(z)
-
-    def sim(self, z1: torch.Tensor, z2: torch.Tensor):
-        z1 = F.normalize(z1)
-        z2 = F.normalize(z2)
-        return torch.mm(z1, z2.t())
-
-    def nei_con_loss(self, z1: torch.Tensor, z2: torch.Tensor, adj, mask=None):
-        """neighbor contrastive loss"""
-        adj = adj - torch.diag_embed(adj.diag())  # remove self-loop
-        adj[adj > 0] = 1
-        nei_count = (
-            torch.sum(adj, 1) * 2 + 1
-        )  # intra-view nei+inter-view nei+self inter-view
-        nei_count = torch.squeeze(torch.tensor(nei_count))
-
-        f = lambda x: torch.exp(x / self.tau)
-
-        if mask is None:
-            intra_view_sim = f(self.sim(z1, z1))
-            inter_view_sim = f(self.sim(z1, z2))
-        else:
-            intra_view_sim = f(self.sim(z1, z1)) * mask
-            inter_view_sim = f(self.sim(z1, z2)) * mask
-
-        loss = (
-            inter_view_sim.diag()
-            + (intra_view_sim.mul(adj)).sum(1)
-            + (inter_view_sim.mul(adj)).sum(1)
-        ) / (intra_view_sim.sum(1) + inter_view_sim.sum(1) - intra_view_sim.diag())
-        loss = loss / nei_count  # divided by the number of positive pairs for each node
-
-        return -torch.log(loss)
+        per_node_loss = (numerator / denominator) / positive_pair_counts
+        return -torch.log(per_node_loss)
 
     def contrastive_loss(
-        self, z1: torch.Tensor, z2: torch.Tensor, adj, mask=None, mean: bool = True
+        self, emb_a: Tensor, emb_b: Tensor, adj: Tensor, mean: bool = True
+    ) -> Tensor:
+        per_node = (
+            self._neighbor_contrastive_loss(emb_a, emb_b, adj)
+            + self._neighbor_contrastive_loss(emb_b, emb_a, adj)
+        ) * 0.5
+        return self._reduce(per_node, mean)
+
+    def _neighbor_contrastive_loss_biased(
+        self, emb_a: Tensor, emb_b: Tensor, adj: Tensor, pseudo_labels: Tensor
+    ) -> Tensor:
+        """Neighbour contrastive loss with pseudo-label negative masking."""
+        adj = self._strip_self_loops(adj)
+        positive_pair_counts = self._positive_pair_counts(adj)
+
+        intra_sim = self.tau_scaling(self.similarity_matrix(emb_a, emb_a))
+        inter_sim = self.tau_scaling(self.similarity_matrix(emb_a, emb_b))
+
+        # Mask pairs that share the same pseudo-label out of the denominator
+        negative_mask = (pseudo_labels.view(-1, 1) != pseudo_labels.view(1, -1)).float()
+        masked_intra_sim = intra_sim * negative_mask
+        masked_inter_sim = inter_sim * negative_mask
+
+        numerator = (
+            inter_sim.diag() + intra_sim.mul(adj).sum(1) + inter_sim.mul(adj).sum(1)
+        )
+        denominator = (
+            masked_intra_sim.sum(1) + masked_inter_sim.sum(1) - intra_sim.diag()
+        )
+
+        per_node_loss = (numerator / denominator) / positive_pair_counts
+        return -torch.log(per_node_loss)
+
+    def contrastive_loss_biased(
+        self,
+        emb_a: Tensor,
+        emb_b: Tensor,
+        adj: Tensor,
+        pseudo_labels: Tensor,
+        mean: bool = True,
+    ) -> Tensor:
+        per_node = (
+            self._neighbor_contrastive_loss_biased(emb_a, emb_b, adj, pseudo_labels)
+            + self._neighbor_contrastive_loss_biased(emb_b, emb_a, adj, pseudo_labels)
+        ) * 0.5
+        return self._reduce(per_node, mean)
+
+
+# Single-View model
+class SVmodel(_ProjectionMixin):
+    def __init__(
+        self,
+        encoder: Encoder,
+        num_hidden: int,
+        num_proj_hidden: int,
+        tau: float = 0.5,
     ):
-        l1 = self.nei_con_loss(z1, z2, adj, mask)
-        l2 = self.nei_con_loss(z2, z1, adj, mask)
-        ret = (l1 + l2) * 0.5
-        ret = ret.mean() if mean else ret.sum()
+        super().__init__(num_hidden, num_proj_hidden, tau)
+        self.encoder = encoder
 
-        return ret
+    def forward(self, node_features: Tensor, edge_index: Tensor) -> Tensor:
+        gnn_embedding = self.encoder(node_features, edge_index)
+        projected_embedding = self.projection(gnn_embedding)
+        return projected_embedding
+
+    def _neighbor_contrastive_loss(
+        self,
+        emb_a: Tensor,
+        emb_b: Tensor,
+        adj: Tensor,
+        sample_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Neighbour contrastive loss with optional per-sample mask."""
+        adj = self._strip_self_loops(adj)
+        positive_pair_counts = self._positive_pair_counts(adj)
+
+        intra_sim = self.tau_scaling(self.similarity_matrix(emb_a, emb_a))
+        inter_sim = self.tau_scaling(self.similarity_matrix(emb_a, emb_b))
+
+        if sample_mask is not None:
+            intra_sim = intra_sim * sample_mask
+            inter_sim = inter_sim * sample_mask
+
+        numerator = (
+            inter_sim.diag() + intra_sim.mul(adj).sum(1) + inter_sim.mul(adj).sum(1)
+        )
+        denominator = intra_sim.sum(1) + inter_sim.sum(1) - intra_sim.diag()
+
+        per_node_loss = (numerator / denominator) / positive_pair_counts
+        return -torch.log(per_node_loss)
+
+    def contrastive_loss(
+        self,
+        emb_a: Tensor,
+        emb_b: Tensor,
+        adj: Tensor,
+        sample_mask: Optional[Tensor] = None,
+        mean: bool = True,
+    ) -> Tensor:
+        per_node = (
+            self._neighbor_contrastive_loss(emb_a, emb_b, adj, sample_mask)
+            + self._neighbor_contrastive_loss(emb_b, emb_a, adj, sample_mask)
+        ) * 0.5
+        return self._reduce(per_node, mean)
 
 
-def drop_feature(x, drop_prob):
+# Graph augmentation utilities
+def drop_feature(node_features: Tensor, drop_prob: float) -> Tensor:
+    """Randomly zeros out feature dimensions with probability `drop_prob`."""
     drop_mask = (
-        torch.empty((x.size(1),), device=torch.device("cpu")).uniform_(0, 1) < drop_prob
+        torch.empty(node_features.size(1), device=torch.device("cpu")).uniform_(0, 1)
+        < drop_prob
     )
-    x = x.clone()
-    x[:, drop_mask] = 0
-
-    return x
+    node_features = node_features.clone()
+    node_features[:, drop_mask] = 0
+    return node_features
 
 
 def filter_adj(
-    row: Tensor, col: Tensor, edge_attr: OptTensor, mask: Tensor
+    row: Tensor, col: Tensor, edge_attr: OptTensor, keep_mask: Tensor
 ) -> Tuple[Tensor, Tensor, OptTensor]:
-    return row[mask], col[mask], None if edge_attr is None else edge_attr[mask]
+    """Filters edge endpoints and attributes by a boolean keep mask."""
+    filtered_attr = None if edge_attr is None else edge_attr[keep_mask]
+    return row[keep_mask], col[keep_mask], filtered_attr
 
 
 def dropout_adj(
@@ -246,29 +279,28 @@ def dropout_adj(
     num_nodes: Optional[int] = None,
     training: bool = True,
 ) -> Tuple[Tensor, Tensor]:
+    """Drops edges stochastically using per-edge weights stored in `edge_attr`."""
     if not training:
         return edge_index, edge_attr
 
     row, col = edge_index
 
     if force_undirected:
-        mask = row <= col
-        row, col, edge_attr = row[mask], col[mask], edge_attr[mask]
+        upper_tri_mask = row <= col
+        row, col, edge_attr = (
+            row[upper_tri_mask],
+            col[upper_tri_mask],
+            edge_attr[upper_tri_mask],
+        )
 
-    edge_attr_scaled = edge_attr
-    edge_attr_scaled_cpu = edge_attr_scaled.to("cpu")
-
-    mask = (
-        torch.rand(edge_attr_scaled.size(0), device=torch.device("cpu"))
-        >= edge_attr_scaled_cpu
-    )
-
-    row, col, edge_attr = filter_adj(row, col, edge_attr, mask)
+    # Each edge is kept if a uniform sample exceeds its weight
+    keep_mask = torch.rand(
+        edge_attr.size(0), device=torch.device("cpu")
+    ) >= edge_attr.to("cpu")
+    row, col, edge_attr = filter_adj(row, col, edge_attr, keep_mask)
 
     if force_undirected:
-        edge_index = torch.stack(
-            [torch.cat([row, col], dim=0), torch.cat([col, row], dim=0)], dim=0
-        )
+        edge_index = torch.stack([torch.cat([row, col]), torch.cat([col, row])], dim=0)
     else:
         edge_index = torch.stack([row, col], dim=0)
 
@@ -285,29 +317,34 @@ def multiple_dropout_average(
     training: bool = True,
     device: str = "cuda",
 ) -> Tuple[Tensor, Tensor]:
+    """
+    Optionally runs multiple dropout trials and keeps edges that survive in at
+    least `threshold_ratio` of trials (simulation path currently disabled).
+    """
     if not training:
         return edge_index, edge_attr
 
     if num_nodes is None:
-        num_nodes = edge_index.max().item() + 1
+        num_nodes = int(edge_index.max().item()) + 1
 
-    edge_index, edge_attr = edge_index.to(device), edge_attr.to(device)
-    simulation_flag = torch.tensor([False])
+    edge_index = edge_index.to(device)
+    edge_attr = edge_attr.to(device)
 
-    if simulation_flag.item():
+    # Simulation path (currently disabled via flag)
+    use_simulation = False
+    if use_simulation:
         edge_count = torch.zeros(
             (num_nodes, num_nodes), dtype=torch.int32, device=device
         )
         for _ in range(num_trials):
             dropped_edge_index, _ = dropout_adj(edge_index, edge_attr, force_undirected)
             dropped_edge_index = dropped_edge_index.to(device)
-            src, dest = dropped_edge_index
-            edge_count[src, dest] += 1
+            src, dst = dropped_edge_index
+            edge_count[src, dst] += 1
             if force_undirected:
-                edge_count[dest, src] += 1
+                edge_count[dst, src] += 1
         threshold = int(num_trials * threshold_ratio)
-        mask = edge_count >= threshold
-        final_edge_index = mask.nonzero().t().contiguous()
+        final_edge_index = (edge_count >= threshold).nonzero().t().contiguous()
     else:
         final_edge_index, _ = dropout_adj(edge_index, edge_attr, force_undirected)
 
@@ -350,37 +387,33 @@ def random_dropout_adj(
         >>> edge_index = torch.tensor([[0, 1, 1, 2, 2, 3],
         ...                            [1, 0, 2, 1, 3, 2]])
         >>> edge_attr = torch.tensor([1, 2, 3, 4, 5, 6])
-        >>> dropout_adj(edge_index, edge_attr)
+        >>> random_dropout_adj(edge_index, edge_attr)
         (tensor([[0, 1, 2, 3],
                 [1, 2, 3, 2]]),
         tensor([1, 3, 5, 6]))
 
         >>> # The returned graph is kept undirected
-        >>> dropout_adj(edge_index, edge_attr, force_undirected=True)
+        >>> random_dropout_adj(edge_index, edge_attr, force_undirected=True)
         (tensor([[0, 1, 2, 1, 2, 3],
                 [1, 2, 3, 0, 1, 2]]),
         tensor([1, 3, 5, 1, 3, 5]))
     """
-
-    if p < 0.0 or p > 1.0:
-        raise ValueError(f"Dropout probability has to be between 0 and 1 (got {p}")
+    if not 0.0 <= p <= 1.0:
+        raise ValueError(f"Dropout probability has to be between 0 and 1 (got {p})")
 
     if not training or p == 0.0:
         return edge_index, edge_attr
 
     row, col = edge_index
-
-    mask = torch.rand(row.size(0), device=torch.device("cpu")) >= p
-
-    if force_undirected:
-        mask[row > col] = False
-
-    row, col, edge_attr = filter_adj(row, col, edge_attr, mask)
+    keep_mask = torch.rand(row.size(0), device=torch.device("cpu")) >= p
 
     if force_undirected:
-        edge_index = torch.stack(
-            [torch.cat([row, col], dim=0), torch.cat([col, row], dim=0)], dim=0
-        )
+        keep_mask[row > col] = False
+
+    row, col, edge_attr = filter_adj(row, col, edge_attr, keep_mask)
+
+    if force_undirected:
+        edge_index = torch.stack([torch.cat([row, col]), torch.cat([col, row])], dim=0)
         if edge_attr is not None:
             edge_attr = torch.cat([edge_attr, edge_attr], dim=0)
     else:
@@ -389,24 +422,29 @@ def random_dropout_adj(
     return edge_index, edge_attr
 
 
-class Discriminator(nn.Module):
-    def __init__(self, input_dim):
-        super(Discriminator, self).__init__()
-        self.dis_layers = 1
-        self.dis_hid_dim = 64
-        self.dis_dropout = 0.2
-        self.dis_input_dropout = 0.1
+# ---------------------------------------------------------------------------
+# Discriminator
+# ---------------------------------------------------------------------------
 
-        layers = [nn.Dropout(self.dis_input_dropout)]
-        for i in range(self.dis_layers + 1):
-            input_dim = input_dim if i == 0 else self.dis_hid_dim
-            output_dim = 1 if i == self.dis_layers else self.dis_hid_dim
-            layers.append(nn.Linear(input_dim, output_dim))
-            if i < self.dis_layers:
-                layers.append(nn.ReLU())
-                layers.append(nn.Dropout(self.dis_dropout))
+
+class Discriminator(nn.Module):
+    _NUM_LAYERS = 1
+    _HIDDEN_DIM = 64
+    _DROPOUT = 0.2
+    _INPUT_DROPOUT = 0.1
+
+    def __init__(self, input_dim: int):
+        super().__init__()
+
+        layers: list[nn.Module] = [nn.Dropout(self._INPUT_DROPOUT)]
+        for i in range(self._NUM_LAYERS + 1):
+            layer_in = input_dim if i == 0 else self._HIDDEN_DIM
+            layer_out = 1 if i == self._NUM_LAYERS else self._HIDDEN_DIM
+            layers.append(nn.Linear(layer_in, layer_out))
+            if i < self._NUM_LAYERS:
+                layers += [nn.ReLU(), nn.Dropout(self._DROPOUT)]
 
         self.layers = nn.Sequential(*layers)
 
-    def forward(self, x):
-        return self.layers(x).view(-1)
+    def forward(self, node_features: Tensor) -> Tensor:
+        return self.layers(node_features).view(-1)

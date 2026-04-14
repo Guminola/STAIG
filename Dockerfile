@@ -60,9 +60,13 @@ RUN pip install rpy2
 RUN R -e "install.packages('mclust', repos='https://cloud.r-project.org', quiet=TRUE)"
 
 # ── Additional scientific Python packages ───────────────────
-COPY requirements.txt /tmp/requirements.txt
+COPY requirements.txt /tmp/requirements.txt# Check if the image still exists
+docker images | grep stagam
+
+# If it's missing, rebuild from your project folder
+cd ~/stagam-docker
+docker build -t stagam:latest .
 RUN pip install --root-user-action=ignore -r /tmp/requirements.txt
-RUN pip install --root-user-action=ignore -r GeneClust --no-deps
 
 # ── Set working directory ────────────────────────────────────
 WORKDIR /workspace

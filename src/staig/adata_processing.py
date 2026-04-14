@@ -14,10 +14,11 @@ from scipy.linalg import block_diag
 from sklearn.metrics.pairwise import rbf_kernel
 from sklearn.cluster import KMeans
 from tqdm import tqdm
-import scGeneClust as gc
+
+# import scGeneClust as gc
 import PyWGCNA
 import NaiveDE
-import SpatialDE
+# import SpatialDE
 
 
 def generate_pseudo_labels(img_emb, n_clusters):

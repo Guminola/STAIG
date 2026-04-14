@@ -102,7 +102,7 @@ class STAGM:
             self.num_hidden,
             self.activation,
             base_model=self.base_model,
-            k=self.num_layers,
+            num_layers=self.num_layers,
         ).to(self.device)
         self.adata = None
         self.mask_slices = True
@@ -190,7 +190,7 @@ class STAGM:
             if self.single:
                 loss = self.model.contrastive_loss(z1, z2, graph_neigh, mask=mask_neigh)
             else:
-                loss = self.model.contrastive_loss_bias(
+                loss = self.model.contrastive_loss_biased(
                     z1, z2, graph_neigh, pseudo_labels
                 )
 
