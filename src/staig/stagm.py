@@ -102,7 +102,7 @@ class STAGM:
             self.num_hidden,
             self.activation,
             base_model=self.base_model,
-            num_layers=self.num_layers,
+            k=self.num_layers,
         ).to(self.device)
         self.adata = None
         self.mask_slices = True
@@ -135,7 +135,6 @@ class STAGM:
         features_matrix = (
             torch.FloatTensor(self.adata.obsm["feat"].copy()).to(self.device).double()
         )
-
         graph_neigh = (
             torch.FloatTensor(self.adata.obsm["graph_neigh"].copy())
             .to(self.device)
@@ -153,9 +152,7 @@ class STAGM:
         if self.single:
             if ("mask_neigh" in self.adata.obsm) and (self.mask_slices):
                 print("Consider intra slice")
-                mask_neigh = torch.FloatTensor(self.adata.obsm["mask_neigh"].copy()).to(
-                    self.device
-                )
+                mask_neigh = torch.FloatTensor(self.adata.obsm["mask_neigh"].copy()).to(self.device)
             else:
                 mask_neigh = None
         else:
@@ -164,24 +161,23 @@ class STAGM:
                     self.adata.obs["pseudo_labels"].cat.codes
                 ).to(self.device)
             else:
-                if "k" in self.config:
-                    pseudo_labels = generate_pseudo_labels(
-                        self.adata.obsm["img_emb"], self.config["k"]
-                    )
-                else:
-                    pseudo_labels = generate_pseudo_labels(self.adata.obsm["img_emb"])
+                pseudo_labels = generate_pseudo_labels(
+                    self.adata.obsm["img_emb"], self.config.get("k", 300)
+                )
                 pseudo_labels = pseudo_labels.to(self.device)
+
+        # --- track per-epoch loss for eva() ---
+        self._loss_curve: list[float] = []
+
+        # --- wall-clock timer ---
+        train_start = t()
 
         print("=== train ===")
         for _ in tqdm.tqdm(range(1, self.num_epochs + 1), bar_format=self.bar_format):
             self.model.train()
             self.optimizer.zero_grad()
-            edge_index_1 = multiple_dropout_average(
-                edge_index, edge_probs, force_undirected=True
-            )[0]
-            edge_index_2 = multiple_dropout_average(
-                edge_index, edge_probs, force_undirected=True
-            )[0]
+            edge_index_1 = multiple_dropout_average(edge_index, edge_probs, force_undirected=True)[0]
+            edge_index_2 = multiple_dropout_average(edge_index, edge_probs, force_undirected=True)[0]
             x_1 = drop_feature(features_matrix, self.drop_feature_rate_1)
             x_2 = drop_feature(features_matrix, self.drop_feature_rate_2)
             z1 = self.model(x_1, edge_index_1)
@@ -190,20 +186,23 @@ class STAGM:
             if self.single:
                 loss = self.model.contrastive_loss(z1, z2, graph_neigh, mask=mask_neigh)
             else:
-                loss = self.model.contrastive_loss_biased(
-                    z1, z2, graph_neigh, pseudo_labels
-                )
+                loss = self.model.contrastive_loss_bias(z1, z2, graph_neigh, pseudo_labels)
 
             loss.backward()
             self.optimizer.step()
+            self._loss_curve.append(loss.item())   # store for eva()
+
+        self._training_time_seconds: float = t() - train_start
 
         if not self.single:
             torch.save(self.model.state_dict(), "model.pt")
+
 
     def eva(self):
         print("=== load ===")
         self.model.load_state_dict(torch.load("model.pt"))
         self.model.eval()
+
         features_matrix = (
             torch.FloatTensor(self.adata.obsm["feat"].copy()).to(self.device).double()
         )
@@ -212,12 +211,71 @@ class STAGM:
             .to(self.device)
             .double()
         )
-
         edge_index = adj_to_edge_index(graph_neigh)
-        self.adata.obsm["emb"] = (
-            self.model(features_matrix, edge_index).detach().cpu().numpy()
-        )
-        print(self.adata.obsm["emb"])
+
+        with torch.no_grad():
+            self.adata.obsm["emb"] = (
+                self.model(features_matrix, edge_index).detach().cpu().numpy()
+            )
+
+        # ------------------------------------------------------------------ #
+        #  Model diagnostics                                                   #
+        # ------------------------------------------------------------------ #
+
+        # --- parameter counts ---
+        total_params     = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+
+        # --- static memory footprint (weights + buffers, fp32 equivalent) ---
+        param_bytes  = sum(p.numel() * p.element_size() for p in self.model.parameters())
+        buffer_bytes = sum(b.numel() * b.element_size() for b in self.model.buffers())
+        model_mb     = (param_bytes + buffer_bytes) / 1024 ** 2
+
+        # --- peak GPU memory allocated during the *current process* ---
+        if self.device.type == "cuda":
+            peak_gpu_mb = torch.cuda.max_memory_allocated(self.device) / 1024 ** 2
+            torch.cuda.reset_peak_memory_stats(self.device)   # reset for next run
+        else:
+            peak_gpu_mb = None
+
+        # --- training time (set by train(); graceful fallback if eva() called standalone) ---
+        training_time = getattr(self, "_training_time_seconds", None)
+
+        # --- loss curve summary ---
+        loss_curve = getattr(self, "_loss_curve", [])
+        if loss_curve:
+            loss_summary = (
+                f"  first={loss_curve[0]:.4f}  "
+                f"last={loss_curve[-1]:.4f}  "
+                f"min={min(loss_curve):.4f}  "
+                f"max={max(loss_curve):.4f}"
+            )
+        else:
+            loss_summary = "  (no loss history — train() was not called this session)"
+
+        # --- embedding stats ---
+        emb      = self.adata.obsm["emb"]
+        emb_norm = np.linalg.norm(emb, axis=1)
+
+        print("\n========== Model Diagnostics ==========")
+        print(f"  Total parameters:     {total_params:,}")
+        print(f"  Trainable parameters: {trainable_params:,}")
+        print(f"  Model weight size:    {model_mb:.2f} MB")
+        if peak_gpu_mb is not None:
+            print(f"  Peak GPU memory:      {peak_gpu_mb:.2f} MB")
+        if training_time is not None:
+            mins, secs = divmod(training_time, 60)
+            print(f"  Training time:        {int(mins)}m {secs:.1f}s  ({training_time:.1f}s total)")
+            if loss_curve:
+                print(f"  Time per epoch:       {training_time / len(loss_curve) * 1000:.1f} ms")
+        print(f"\n  Loss curve:          {loss_summary}")
+        print(f"\n  Embedding shape:      {emb.shape}")
+        print(f"  Embedding norm — mean={emb_norm.mean():.4f}  "
+              f"std={emb_norm.std():.4f}  "
+              f"min={emb_norm.min():.4f}  "
+              f"max={emb_norm.max():.4f}")
+        print("=======================================\n")
+
         print("embedding generated, go clustering")
 
     def cluster(self, label=True):

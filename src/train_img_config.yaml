@@ -9,7 +9,7 @@
   drop_feature_rate_1: 0.1
   drop_feature_rate_2: 0.2
   tau: 35
-  num_epochs: 100
+  num_epochs: 300
   weight_decay: 0.00001
   num_clusters: 7
   num_gene: 3000
